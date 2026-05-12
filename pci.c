@@ -2,15 +2,22 @@
 
 #include <linux/pci.h>
 #include <linux/irq.h>
+#include <linux/irqdesc.h>
+#include <linux/irqdomain.h>
+#include <linux/irqflags.h>
 #include <linux/version.h>
 
 #include <linux/percpu-defs.h>
 #include <linux/sched/clock.h>
 
+#if defined(CONFIG_X86) && defined(CONFIG_NVMEV_FAST_X86_IRQ_HANDLING)
+#include <asm/apic.h>
+#endif
+
 #include "nvmev.h"
 #include "pci.h"
 
-#ifdef CONFIG_NVMEV_FAST_X86_IRQ_HANDLING
+#if defined(CONFIG_X86) && defined(CONFIG_NVMEV_FAST_X86_IRQ_HANDLING)
 static int apicid_to_cpuid[256];
 
 static void __init_apicid_to_cpuid(void)
@@ -37,40 +44,37 @@ static void __signal_irq(const char *type, unsigned int irq)
 #else
 static void __signal_irq(const char *type, unsigned int irq)
 {
+#ifdef CONFIG_ARM64
+	unsigned long flags;
+
+	NVMEV_DEBUG_VERBOSE("irq: %s %d\n", type, irq);
+	local_irq_save(flags);
+	generic_handle_irq(irq);
+	local_irq_restore(flags);
+#else
 	struct irq_data *data = irq_get_irq_data(irq);
 	struct irq_chip *chip = irq_data_get_irq_chip(data);
 
+#ifdef CONFIG_X86
 	NVMEV_DEBUG_VERBOSE("irq: %s %d, vector %d\n", type, irq, irqd_cfg(data)->vector);
+#else
+	NVMEV_DEBUG_VERBOSE("irq: %s %d\n", type, irq);
+#endif
 	BUG_ON(!chip->irq_retrigger);
 	chip->irq_retrigger(data);
-
-	return;
+#endif
 }
 #endif
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 17, 0)
 static void __process_msi_irq(int msi_index)
 {
-	unsigned int virq = msi_get_virq(&nvmev_vdev->pdev->dev, msi_index);
+	int virq = pci_irq_vector(nvmev_vdev->pdev, msi_index);
 
-	BUG_ON(virq == 0);
+	if (virq < 0)
+		BUG();
+
 	__signal_irq("msi", virq);
 }
-#else
-static void __process_msi_irq(int msi_index)
-{
-	struct msi_desc *msi_desc, *tmp;
-
-	for_each_msi_entry_safe(msi_desc, tmp, (&nvmev_vdev->pdev->dev)) {
-		if (msi_desc->msi_attrib.entry_nr == msi_index) {
-			__signal_irq("msi", msi_desc->irq);
-			return;
-		}
-	}
-	NVMEV_INFO("Failed to send IPI\n");
-	BUG_ON(!msi_desc);
-}
-#endif
 
 void nvmev_signal_irq(int msi_index)
 {
@@ -81,6 +85,47 @@ void nvmev_signal_irq(int msi_index)
 
 		__signal_irq("int", nvmev_vdev->pdev->irq);
 	}
+}
+
+#define NVMEV_BAR_CAP		0x00
+#define NVMEV_BAR_VS		0x08
+#define NVMEV_BAR_CC		0x14
+#define NVMEV_BAR_CSTS		0x1c
+#define NVMEV_BAR_AQA		0x24
+#define NVMEV_BAR_ASQ		0x28
+#define NVMEV_BAR_ACQ		0x30
+
+#define NVMEV_AQA_ASQS(aqa)	((aqa) & 0xfff)
+#define NVMEV_AQA_ACQS(aqa)	(((aqa) >> 16) & 0xfff)
+#define NVMEV_CC_EN(cc)		((cc) & 0x1)
+#define NVMEV_CC_SHN(cc)	(((cc) >> 14) & 0x3)
+#define NVMEV_CSTS_RDY		0x1
+#define NVMEV_CSTS_SHST_MASK	(0x3 << 2)
+#define NVMEV_CSTS_SHST_COMPLETE (0x2 << 2)
+
+static inline void __iomem *__nvmev_bar_addr(u32 offset)
+{
+	return (void __iomem *)((u8 __iomem *)nvmev_vdev->bar + offset);
+}
+
+static inline u32 __nvmev_bar_read32(u32 offset)
+{
+	return readl(__nvmev_bar_addr(offset));
+}
+
+static inline u64 __nvmev_bar_read64(u32 offset)
+{
+	return readq(__nvmev_bar_addr(offset));
+}
+
+static inline void __nvmev_bar_write32(u32 offset, u32 val)
+{
+	writel(val, __nvmev_bar_addr(offset));
+}
+
+static inline void __nvmev_bar_write64(u32 offset, u64 val)
+{
+	writeq(val, __nvmev_bar_addr(offset));
 }
 
 /*
@@ -100,45 +145,18 @@ void nvmev_signal_irq(int msi_index)
 bool nvmev_proc_bars(void)
 {
 	volatile struct __nvme_bar *old_bar = nvmev_vdev->old_bar;
-	volatile struct nvme_ctrl_regs *bar = nvmev_vdev->bar;
 	struct nvmev_admin_queue *queue = nvmev_vdev->admin_q;
+	u32 aqa = __nvmev_bar_read32(NVMEV_BAR_AQA);
+	u64 asq = __nvmev_bar_read64(NVMEV_BAR_ASQ);
+	u64 acq = __nvmev_bar_read64(NVMEV_BAR_ACQ);
+	u32 cc = __nvmev_bar_read32(NVMEV_BAR_CC);
+	u32 csts = __nvmev_bar_read32(NVMEV_BAR_CSTS);
 	unsigned int num_pages, i;
 
-#if 0 /* Read-only register */
-	if (old_bar->cap != bar->u_cap) {
-		memcpy(&old_bar->cap, &bar->cap, sizeof(old_bar->cap));
-	}
-	if (old_bar->vs != bar->u_vs) {
-		memcpy(&old_bar->vs, &bar->vs, sizeof(old_bar->vs));
-	}
-	if (old_bar->cmbloc != bar->u_cmbloc) {
-		memcpy(&old_bar->cmbloc, &bar->cmbloc, sizeof(old_bar->cmbloc));
-	}
-	if (old_bar->cmbsz != bar->u_cmbsz) {
-		memcpy(&old_bar->cmbsz, &bar->cmbsz, sizeof(old_bar->cmbsz));
-	}
-	if (old_bar->rsvd1 != bar->rsvd1) {
-		memcpy(&old_bar->rsvd1, &bar->rsvd1, sizeof(old_bar->rsvd1));
-	}
-	if (old_bar->csts != bar->u_csts) {
-		memcpy(&old_bar->csts, &bar->csts, sizeof(old_bar->csts));
-	}
-#endif
-#if 0 /* Unused registers */
-	if (old_bar->intms != bar->intms) {
-		memcpy(&old_bar->intms, &bar->intms, sizeof(old_bar->intms));
-	}
-	if (old_bar->intmc != bar->intmc) {
-		memcpy(&old_bar->intmc, &bar->intmc, sizeof(old_bar->intmc));
-	}
-	if (old_bar->nssr != bar->nssr) {
-		memcpy(&old_bar->nssr, &bar->nssr, sizeof(old_bar->nssr));
-	}
-#endif
-	if (old_bar->aqa != bar->u_aqa) {
+	if (old_bar->aqa != aqa) {
 		// Initalize admin queue
-		NVMEV_DEBUG("%s: aqa 0x%x -> 0x%x\n", __func__, old_bar->aqa, bar->u_aqa);
-		old_bar->aqa = bar->u_aqa;
+		NVMEV_DEBUG("%s: aqa 0x%x -> 0x%x\n", __func__, old_bar->aqa, aqa);
+		old_bar->aqa = aqa;
 
 		if (!queue) {
 			queue = kzalloc(sizeof(struct nvmev_admin_queue), GFP_KERNEL);
@@ -150,15 +168,17 @@ bool nvmev_proc_bars(void)
 
 		queue->cq_head = 0;
 		queue->phase = 1;
-		queue->sq_depth = bar->aqa.asqs + 1; /* asqs and acqs are 0-based */
-		queue->cq_depth = bar->aqa.acqs + 1;
+		queue->sq_depth = NVMEV_AQA_ASQS(aqa) + 1; /* asqs and acqs are 0-based */
+		queue->cq_depth = NVMEV_AQA_ACQS(aqa) + 1;
 
-		nvmev_vdev->dbs[0] = nvmev_vdev->old_dbs[0] = 0;
-		nvmev_vdev->dbs[1] = nvmev_vdev->old_dbs[1] = 0;
+		nvmev_db_write(0, 0);
+		nvmev_db_write(1, 0);
+		nvmev_vdev->old_dbs[0] = 0;
+		nvmev_vdev->old_dbs[1] = 0;
 
 		goto out;
 	}
-	if (old_bar->asq != bar->u_asq) {
+	if (old_bar->asq != asq) {
 		if (queue == NULL) {
 			/*
 			 * asq/acq can't be updated later than aqa, but in an unlikely case, this
@@ -172,15 +192,15 @@ bool nvmev_proc_bars(void)
 			goto out;
 		}
 
-		NVMEV_DEBUG("%s: asq 0x%llx -> 0x%llx\n", __func__, old_bar->asq, bar->u_asq);
-		old_bar->asq = bar->u_asq;
+		NVMEV_DEBUG("%s: asq 0x%llx -> 0x%llx\n", __func__, old_bar->asq, asq);
+		old_bar->asq = asq;
 
 		if (queue->nvme_sq) {
 			kfree(queue->nvme_sq);
 			queue->nvme_sq = NULL;
 		}
 
-		queue->sq_depth = bar->aqa.asqs + 1; /* asqs and acqs are 0-based */
+		queue->sq_depth = NVMEV_AQA_ASQS(old_bar->aqa) + 1; /* asqs and acqs are 0-based */
 
 		num_pages = DIV_ROUND_UP(queue->sq_depth * sizeof(struct nvme_command), PAGE_SIZE);
 		queue->nvme_sq = kcalloc(num_pages, sizeof(struct nvme_command *), GFP_KERNEL);
@@ -188,29 +208,30 @@ bool nvmev_proc_bars(void)
 
 		for (i = 0; i < num_pages; i++) {
 			queue->nvme_sq[i] =
-				page_address(pfn_to_page(nvmev_vdev->bar->u_asq >> PAGE_SHIFT) + i);
+				page_address(pfn_to_page(asq >> PAGE_SHIFT) + i);
 		}
 
-		nvmev_vdev->dbs[0] = nvmev_vdev->old_dbs[0] = 0;
+		nvmev_db_write(0, 0);
+		nvmev_vdev->old_dbs[0] = 0;
 
 		goto out;
 	}
-	if (old_bar->acq != bar->u_acq) {
+	if (old_bar->acq != acq) {
 		if (queue == NULL) {
 			// See comment above
 			NVMEV_INFO("acq triggered before aqa, retrying\n");
 			goto out;
 		}
 
-		NVMEV_DEBUG("%s: acq 0x%llx -> 0x%llx\n", __func__, old_bar->acq, bar->u_acq);
-		old_bar->acq = bar->u_acq;
+		NVMEV_DEBUG("%s: acq 0x%llx -> 0x%llx\n", __func__, old_bar->acq, acq);
+		old_bar->acq = acq;
 
 		if (queue->nvme_cq) {
 			kfree(queue->nvme_cq);
 			queue->nvme_cq = NULL;
 		}
 
-		queue->cq_depth = bar->aqa.acqs + 1; /* asqs and acqs are 0-based */
+		queue->cq_depth = NVMEV_AQA_ACQS(old_bar->aqa) + 1; /* asqs and acqs are 0-based */
 
 		num_pages =
 			DIV_ROUND_UP(queue->cq_depth * sizeof(struct nvme_completion), PAGE_SIZE);
@@ -221,37 +242,42 @@ bool nvmev_proc_bars(void)
 
 		for (i = 0; i < num_pages; i++) {
 			queue->nvme_cq[i] =
-				page_address(pfn_to_page(nvmev_vdev->bar->u_acq >> PAGE_SHIFT) + i);
+				page_address(pfn_to_page(acq >> PAGE_SHIFT) + i);
 		}
 
-		nvmev_vdev->dbs[1] = nvmev_vdev->old_dbs[1] = 0;
+		nvmev_db_write(1, 0);
+		nvmev_vdev->old_dbs[1] = 0;
 
 		goto out;
 	}
-	if (old_bar->cc != bar->u_cc) {
-		NVMEV_DEBUG("%s: cc 0x%x:%x -> 0x%x:%x\n", __func__, old_bar->cc, old_bar->csts, bar->u_cc,
-			    bar->u_csts);
+	if (old_bar->cc != cc) {
+		NVMEV_DEBUG("%s: cc 0x%x:%x -> 0x%x:%x\n", __func__, old_bar->cc,
+			    old_bar->csts, cc, csts);
 		/* Enable */
-		if (bar->cc.en == 1) {
+		if (NVMEV_CC_EN(cc) == 1) {
 			if (nvmev_vdev->admin_q) {
-				bar->csts.rdy = 1;
+				csts |= NVMEV_CSTS_RDY;
 			} else {
 				WARN_ON("Enable device without init admin q");
 			}
-		} else if (bar->cc.en == 0) {
-			bar->csts.rdy = 0;
+		} else if (NVMEV_CC_EN(cc) == 0) {
+			csts &= ~NVMEV_CSTS_RDY;
 		}
 
 		/* Shutdown */
-		if (bar->cc.shn == 1) {
-			bar->csts.shst = 2;
+		if (NVMEV_CC_SHN(cc) == 1) {
+			csts = (csts & ~NVMEV_CSTS_SHST_MASK) | NVMEV_CSTS_SHST_COMPLETE;
 
-			nvmev_vdev->dbs[0] = nvmev_vdev->old_dbs[0] = 0;
-			nvmev_vdev->dbs[1] = nvmev_vdev->old_dbs[1] = 0;
+			nvmev_db_write(0, 0);
+			nvmev_db_write(1, 0);
+			nvmev_vdev->old_dbs[0] = 0;
+			nvmev_vdev->old_dbs[1] = 0;
 			nvmev_vdev->admin_q->cq_head = 0;
 		}
 
-		old_bar->cc = bar->u_cc;
+		__nvmev_bar_write32(NVMEV_BAR_CSTS, csts);
+		old_bar->cc = cc;
+		old_bar->csts = csts;
 
 		goto out;
 	}
@@ -340,37 +366,206 @@ static struct pci_ops nvmev_pci_ops = {
 	.write = nvmev_pci_write,
 };
 
+#ifdef CONFIG_X86
 static struct pci_sysdata nvmev_pci_sysdata = {
 	.domain = NVMEV_PCI_DOMAIN_NUM,
 	.node = 0,
 };
+#endif
 
+#if defined(CONFIG_ARM64) && defined(CONFIG_PCI_MSI_IRQ_DOMAIN) && defined(CONFIG_GENERIC_MSI_IRQ_DOMAIN)
+static struct irq_domain *nvmev_msi_parent_domain;
+static struct irq_domain *nvmev_pci_msi_domain;
+static struct fwnode_handle *nvmev_msi_parent_fwnode;
+static struct fwnode_handle *nvmev_pci_msi_fwnode;
 
-static void __dump_pci_dev(struct pci_dev *dev)
+static void nvmev_msi_parent_compose_msg(struct irq_data *data, struct msi_msg *msg)
 {
-	/*
-	NVMEV_DEBUG("bus: %p, subordinate: %p\n", dev->bus, dev->subordinate);
-	NVMEV_DEBUG("vendor: %x, device: %x\n", dev->vendor, dev->device);
-	NVMEV_DEBUG("s_vendor: %x, s_device: %x\n", dev->subsystem_vendor, dev->subsystem_device);
-	NVMEV_DEBUG("devfn: %u, class: %x\n", dev->devfn, dev->class);
-	NVMEV_DEBUG("sysdata: %p, slot: %p\n", dev->sysdata, dev->slot);
-	NVMEV_DEBUG("pin: %d, irq: %u\n", dev->pin, dev->irq);
-	NVMEV_DEBUG("msi: %d, msi-x:%d\n", dev->msi_enabled, dev->msix_enabled);
-	NVMEV_DEBUG("resource[0]: %llx\n", pci_resource_start(dev, 0));
-	*/
+	memset(msg, 0, sizeof(*msg));
+	msg->data = (u32)irqd_to_hwirq(data);
+}
+
+static int nvmev_msi_parent_set_affinity(struct irq_data *data, const struct cpumask *dest,
+					 bool force)
+{
+	return IRQ_SET_MASK_OK_DONE;
+}
+
+static struct irq_chip nvmev_msi_parent_chip = {
+	.name = "NVMeVirt-MSI-parent",
+	.irq_compose_msi_msg = nvmev_msi_parent_compose_msg,
+	.irq_set_affinity = nvmev_msi_parent_set_affinity,
+};
+
+static int nvmev_msi_parent_alloc(struct irq_domain *domain, unsigned int virq,
+				  unsigned int nr_irqs, void *arg)
+{
+	msi_alloc_info_t *info = arg;
+	irq_hw_number_t hwirq = info ? info->hwirq : virq;
+	unsigned int i;
+	int ret;
+
+	for (i = 0; i < nr_irqs; i++) {
+		ret = irq_domain_set_hwirq_and_chip(domain, virq + i, hwirq + i,
+						    &nvmev_msi_parent_chip, NULL);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
+}
+
+static void nvmev_msi_parent_free(struct irq_domain *domain, unsigned int virq,
+				  unsigned int nr_irqs)
+{
+	irq_domain_free_irqs_common(domain, virq, nr_irqs);
+}
+
+static const struct irq_domain_ops nvmev_msi_parent_domain_ops = {
+	.alloc = nvmev_msi_parent_alloc,
+	.free = nvmev_msi_parent_free,
+};
+
+static struct irq_chip nvmev_pci_msi_chip = {
+	.name = "NVMeVirt-PCI-MSI",
+};
+
+static struct msi_domain_info nvmev_pci_msi_domain_info = {
+	.flags = MSI_FLAG_USE_DEF_DOM_OPS | MSI_FLAG_USE_DEF_CHIP_OPS | MSI_FLAG_PCI_MSIX,
+	.chip = &nvmev_pci_msi_chip,
+	.handler = handle_simple_irq,
+	.handler_name = "edge",
+};
+
+static bool __init_nvmev_msi_domain(void)
+{
+	if (nvmev_pci_msi_domain)
+		return true;
+
+	nvmev_msi_parent_fwnode = irq_domain_alloc_named_fwnode("NVMeVirt-MSI-parent");
+	if (!nvmev_msi_parent_fwnode)
+		return false;
+
+	nvmev_msi_parent_domain =
+		irq_domain_create_hierarchy(NULL, 0, 0, nvmev_msi_parent_fwnode,
+					    &nvmev_msi_parent_domain_ops, NULL);
+	if (!nvmev_msi_parent_domain)
+		goto err_parent_domain;
+
+	nvmev_pci_msi_fwnode = irq_domain_alloc_named_fwnode("NVMeVirt-PCI-MSI");
+	if (!nvmev_pci_msi_fwnode)
+		goto err_child_fwnode;
+
+	nvmev_pci_msi_domain =
+		pci_msi_create_irq_domain(nvmev_pci_msi_fwnode,
+					  &nvmev_pci_msi_domain_info,
+					  nvmev_msi_parent_domain);
+	if (!nvmev_pci_msi_domain)
+		goto err_child_domain;
+
+	return true;
+
+err_child_domain:
+	irq_domain_free_fwnode(nvmev_pci_msi_fwnode);
+	nvmev_pci_msi_fwnode = NULL;
+err_child_fwnode:
+	irq_domain_remove(nvmev_msi_parent_domain);
+	nvmev_msi_parent_domain = NULL;
+err_parent_domain:
+	irq_domain_free_fwnode(nvmev_msi_parent_fwnode);
+	nvmev_msi_parent_fwnode = NULL;
+	return false;
+}
+
+static void __destroy_nvmev_msi_domain(void)
+{
+	if (nvmev_pci_msi_domain) {
+		irq_domain_remove(nvmev_pci_msi_domain);
+		nvmev_pci_msi_domain = NULL;
+	}
+
+	if (nvmev_pci_msi_fwnode) {
+		irq_domain_free_fwnode(nvmev_pci_msi_fwnode);
+		nvmev_pci_msi_fwnode = NULL;
+	}
+
+	if (nvmev_msi_parent_domain) {
+		irq_domain_remove(nvmev_msi_parent_domain);
+		nvmev_msi_parent_domain = NULL;
+	}
+
+	if (nvmev_msi_parent_fwnode) {
+		irq_domain_free_fwnode(nvmev_msi_parent_fwnode);
+		nvmev_msi_parent_fwnode = NULL;
+	}
+}
+
+static void __attach_nvmev_msi_domain(struct pci_bus *bus)
+{
+	dev_set_msi_domain(&bus->dev, nvmev_pci_msi_domain);
+}
+
+static void __attach_nvmev_device_msi_domain(struct pci_dev *dev)
+{
+	dev_set_msi_domain(&dev->dev, nvmev_pci_msi_domain);
+}
+#elif defined(CONFIG_ARM64)
+static bool __init_nvmev_msi_domain(void)
+{
+	NVMEV_ERROR("ARM64 requires CONFIG_PCI_MSI_IRQ_DOMAIN and CONFIG_GENERIC_MSI_IRQ_DOMAIN\n");
+	return false;
+}
+
+static void __destroy_nvmev_msi_domain(void)
+{
+}
+
+static void __attach_nvmev_msi_domain(struct pci_bus *bus)
+{
+}
+
+static void __attach_nvmev_device_msi_domain(struct pci_dev *dev)
+{
+}
+#else
+static bool __init_nvmev_msi_domain(void)
+{
+	return true;
+}
+
+static void __destroy_nvmev_msi_domain(void)
+{
+}
+
+static void __attach_nvmev_msi_domain(struct pci_bus *bus)
+{
+}
+
+static void __attach_nvmev_device_msi_domain(struct pci_dev *dev)
+{
+}
+#endif
+
+static void __force_nvmev_bar_resource(struct pci_dev *dev)
+{
+	struct resource *res = &dev->resource[0];
+	resource_size_t start = nvmev_vdev->config.memmap_start;
+	resource_size_t end = start + (PAGE_SIZE * 4) - 1;
+
+	res->start = start;
+	res->end = end;
+	res->flags = IORESOURCE_MEM | IORESOURCE_MEM_64;
+	res->parent = &iomem_resource;
+
+	nvmev_vdev->pcihdr->mlbar.tp = PCI_BASE_ADDRESS_MEM_TYPE_64 >> 1;
+	nvmev_vdev->pcihdr->mlbar.ba = (start & 0xFFFFFFFF) >> 14;
+	nvmev_vdev->pcihdr->mulbar = start >> 32;
 }
 
 static void __init_nvme_ctrl_regs(struct pci_dev *dev)
 {
-	struct nvme_ctrl_regs *bar = memremap(pci_resource_start(dev, 0), PAGE_SIZE * 2, MEMREMAP_WT);
-	BUG_ON(!bar);
-
-	nvmev_vdev->bar = bar;
-	memset(bar, 0x0, PAGE_SIZE * 2);
-
-	nvmev_vdev->dbs = ((void *)bar) + PAGE_SIZE;
-
-	*bar = (struct nvme_ctrl_regs) {
+	resource_size_t bar_start = nvmev_vdev->config.memmap_start;
+	struct nvme_ctrl_regs init_bar = {
 		.cap = {
 			.to = 1,
 			.mpsmin = 0,
@@ -384,16 +579,64 @@ static void __init_nvme_ctrl_regs(struct pci_dev *dev)
 			.mnr = 0,
 		},
 	};
+	void __iomem *bar;
+
+	bar = ioremap(bar_start, PAGE_SIZE * 2);
+	BUG_ON(!bar);
+
+	nvmev_vdev->bar = bar;
+
+	memset_io(nvmev_vdev->bar, 0x0, PAGE_SIZE * 2);
+
+	nvmev_vdev->dbs = (u32 __iomem *)((u8 __iomem *)bar + PAGE_SIZE);
+
+	__nvmev_bar_write64(NVMEV_BAR_CAP, init_bar.u_cap);
+	__nvmev_bar_write32(NVMEV_BAR_VS, init_bar.u_vs);
 }
+
+#ifndef CONFIG_X86
+static struct resource nvmev_pci_busn_resource = {
+	.name = "NVMeVirt busn",
+	.start = NVMEV_PCI_BUS_NUM,
+	.end = NVMEV_PCI_BUS_NUM,
+	.flags = IORESOURCE_BUS,
+};
+#endif
 
 static struct pci_bus *__create_pci_bus(void)
 {
+#ifndef CONFIG_X86
+	LIST_HEAD(resources);
+#endif
 	struct pci_bus *bus = NULL;
 	struct pci_dev *dev;
+	int node = cpu_to_node(nvmev_vdev->config.cpu_nr_dispatcher);
 
-	nvmev_pci_sysdata.node = cpu_to_node(nvmev_vdev->config.cpu_nr_dispatcher);
-
+#ifdef CONFIG_X86
+	nvmev_pci_sysdata.node = node;
 	bus = pci_scan_bus(NVMEV_PCI_BUS_NUM, &nvmev_pci_ops, &nvmev_pci_sysdata);
+#else
+
+	nvmev_pci_busn_resource.start = NVMEV_PCI_BUS_NUM;
+	nvmev_pci_busn_resource.end = NVMEV_PCI_BUS_NUM;
+	nvmev_pci_busn_resource.flags = IORESOURCE_BUS;
+
+	pci_add_resource(&resources, &ioport_resource);
+	pci_add_resource(&resources, &iomem_resource);
+	pci_add_resource(&resources, &nvmev_pci_busn_resource);
+
+	bus = pci_create_root_bus(NULL, NVMEV_PCI_BUS_NUM, &nvmev_pci_ops, NULL,
+				  &resources);
+	if (!bus) {
+		pci_free_resource_list(&resources);
+		NVMEV_ERROR("Unable to create PCI bus\n");
+		return NULL;
+	}
+
+	__attach_nvmev_msi_domain(bus);
+
+	pci_scan_child_bus(bus);
+#endif
 
 	if (!bus) {
 		NVMEV_ERROR("Unable to create PCI bus\n");
@@ -402,30 +645,40 @@ static struct pci_bus *__create_pci_bus(void)
 
 	/* XXX Only support a singe NVMeVirt instance in the system for now */
 	list_for_each_entry(dev, &bus->devices, bus_list) {
-		struct resource *res = &dev->resource[0];
-		res->parent = &iomem_resource;
-
+		__attach_nvmev_device_msi_domain(dev);
 		nvmev_vdev->pdev = dev;
 		dev->irq = nvmev_vdev->pcihdr->intr.iline;
-		__dump_pci_dev(dev);
+#ifdef CONFIG_ARM64
+		/*
+		 * NVMeVirt performs the virtual device DMA from CPU context. Make
+		 * the synthetic PCI function use coherent DMA allocations so the
+		 * host NVMe driver's admin queues share normal cacheable memory
+		 * attributes with NVMeVirt's direct-map access.
+		 */
+		dev->dev.dma_coherent = true;
+#endif
+		__force_nvmev_bar_resource(dev);
 
 		__init_nvme_ctrl_regs(dev);
 
 		nvmev_vdev->old_dbs = kzalloc(PAGE_SIZE, GFP_KERNEL);
 		BUG_ON(!nvmev_vdev->old_dbs && "allocating old DBs memory");
-		memcpy(nvmev_vdev->old_dbs, nvmev_vdev->dbs, sizeof(*nvmev_vdev->old_dbs));
 
 		nvmev_vdev->old_bar = kzalloc(PAGE_SIZE, GFP_KERNEL);
 		BUG_ON(!nvmev_vdev->old_bar && "allocating old BAR memory");
-		memcpy(nvmev_vdev->old_bar, nvmev_vdev->bar, sizeof(*nvmev_vdev->old_bar));
+		memcpy_fromio(nvmev_vdev->old_bar, nvmev_vdev->bar,
+			      sizeof(*nvmev_vdev->old_bar));
 
 		nvmev_vdev->msix_table =
-			memremap(pci_resource_start(nvmev_vdev->pdev, 0) + PAGE_SIZE * 2,
-				 NR_MAX_IO_QUEUE * PCI_MSIX_ENTRY_SIZE, MEMREMAP_WT);
-		memset(nvmev_vdev->msix_table, 0x00, NR_MAX_IO_QUEUE * PCI_MSIX_ENTRY_SIZE);
+			ioremap(nvmev_vdev->config.memmap_start + PAGE_SIZE * 2,
+				NR_MAX_IO_QUEUE * PCI_MSIX_ENTRY_SIZE);
+		BUG_ON(!nvmev_vdev->msix_table);
+
+		memset_io(nvmev_vdev->msix_table, 0x00,
+			  NR_MAX_IO_QUEUE * PCI_MSIX_ENTRY_SIZE);
 	}
 
-	NVMEV_INFO("Virtual PCI bus created (node %d)\n", nvmev_pci_sysdata.node);
+	NVMEV_INFO("Virtual PCI bus created (node %d)\n", node);
 
 	return bus;
 };
@@ -450,11 +703,13 @@ struct nvmev_dev *VDEV_INIT(void)
 
 void VDEV_FINALIZE(struct nvmev_dev *nvmev_vdev)
 {
+	__destroy_nvmev_msi_domain();
+
 	if (nvmev_vdev->msix_table)
-		memunmap(nvmev_vdev->msix_table);
+		iounmap(nvmev_vdev->msix_table);
 
 	if (nvmev_vdev->bar)
-		memunmap(nvmev_vdev->bar);
+		iounmap(nvmev_vdev->bar);
 
 	if (nvmev_vdev->old_bar)
 		kfree(nvmev_vdev->old_bar);
@@ -621,14 +876,19 @@ bool NVMEV_PCI_INIT(struct nvmev_dev *nvmev_vdev)
 	PCI_PCIECAP_SETTINGS(nvmev_vdev->pciecap);
 	PCI_EXTCAP_SETTINGS(nvmev_vdev->extcap);
 
-#ifdef CONFIG_NVMEV_FAST_X86_IRQ_HANDLING
+#if defined(CONFIG_X86) && defined(CONFIG_NVMEV_FAST_X86_IRQ_HANDLING)
 	__init_apicid_to_cpuid();
 #endif
 	nvmev_vdev->intx_disabled = false;
 
-	nvmev_vdev->virt_bus = __create_pci_bus();
-	if (!nvmev_vdev->virt_bus)
+	if (!__init_nvmev_msi_domain())
 		return false;
+
+	nvmev_vdev->virt_bus = __create_pci_bus();
+	if (!nvmev_vdev->virt_bus) {
+		__destroy_nvmev_msi_domain();
+		return false;
+	}
 
 	return true;
 }

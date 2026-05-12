@@ -5,7 +5,7 @@
 
 #include <linux/pci.h>
 #include <linux/msi.h>
-#include <asm/apic.h>
+#include <linux/io.h>
 
 #include "nvme.h"
 
@@ -258,7 +258,6 @@ struct nvmev_dev {
 	struct proc_dir_entry *proc_write_times;
 	struct proc_dir_entry *proc_io_units;
 	struct proc_dir_entry *proc_stat;
-	struct proc_dir_entry *proc_debug;
 
 	unsigned long long *io_unit_stat;
 };
@@ -297,6 +296,17 @@ struct nvmev_ns {
 
 // VDEV Init, Final Function
 extern struct nvmev_dev *nvmev_vdev;
+
+static inline u32 nvmev_db_read(unsigned int idx)
+{
+	return readl(nvmev_vdev->dbs + idx);
+}
+
+static inline void nvmev_db_write(unsigned int idx, u32 val)
+{
+	writel(val, nvmev_vdev->dbs + idx);
+}
+
 struct nvmev_dev *VDEV_INIT(void);
 void VDEV_FINALIZE(struct nvmev_dev *nvmev_vdev);
 

@@ -14,6 +14,9 @@
 #ifdef CONFIG_X86
 #include <asm/e820/types.h>
 #include <asm/e820/api.h>
+#elif defined(CONFIG_ARM64)
+#include <linux/ioport.h>
+#include <linux/mm.h>
 #endif
 
 #include "nvmev.h"
@@ -71,7 +74,10 @@ static unsigned int nr_io_units = 8;
 static unsigned int io_unit_shift = 12;
 
 static char *cpus;
-static unsigned int debug = 0;
+static bool storage_initialized = false;
+static bool namespace_initialized = false;
+static bool io_worker_initialized = false;
+static bool dispatcher_initialized = false;
 
 int io_using_dma = false;
 
@@ -109,7 +115,6 @@ module_param(io_unit_shift, uint, 0444);
 MODULE_PARM_DESC(io_unit_shift, "Size of each I/O unit (2^)");
 module_param(cpus, charp, 0444);
 MODULE_PARM_DESC(cpus, "CPU list for process, completion(int.) threads, Seperated by Comma(,)");
-module_param(debug, uint, 0644);
 
 // Returns true if an event is processed
 static bool nvmev_proc_dbs(void)
@@ -121,13 +126,13 @@ static bool nvmev_proc_dbs(void)
 	bool updated = false;
 
 	// Admin queue
-	new_db = nvmev_vdev->dbs[0];
+	new_db = nvmev_db_read(0);
 	if (new_db != nvmev_vdev->old_dbs[0]) {
 		nvmev_proc_admin_sq(new_db, nvmev_vdev->old_dbs[0]);
 		nvmev_vdev->old_dbs[0] = new_db;
 		updated = true;
 	}
-	new_db = nvmev_vdev->dbs[1];
+	new_db = nvmev_db_read(1);
 	if (new_db != nvmev_vdev->old_dbs[1]) {
 		nvmev_proc_admin_cq(new_db, nvmev_vdev->old_dbs[1]);
 		nvmev_vdev->old_dbs[1] = new_db;
@@ -139,7 +144,7 @@ static bool nvmev_proc_dbs(void)
 		if (nvmev_vdev->sqes[qid] == NULL)
 			continue;
 		dbs_idx = qid * 2;
-		new_db = nvmev_vdev->dbs[dbs_idx];
+		new_db = nvmev_db_read(dbs_idx);
 		old_db = nvmev_vdev->old_dbs[dbs_idx];
 		if (new_db != old_db) {
 			nvmev_vdev->old_dbs[dbs_idx] = nvmev_proc_io_sq(qid, new_db, old_db);
@@ -152,7 +157,7 @@ static bool nvmev_proc_dbs(void)
 		if (nvmev_vdev->cqes[qid] == NULL)
 			continue;
 		dbs_idx = qid * 2 + 1;
-		new_db = nvmev_vdev->dbs[dbs_idx];
+		new_db = nvmev_db_read(dbs_idx);
 		old_db = nvmev_vdev->old_dbs[dbs_idx];
 		if (new_db != old_db) {
 			nvmev_proc_io_cq(qid, new_db, old_db);
@@ -227,6 +232,21 @@ static int __validate_configs_arch(void)
 	}
 	return 0;
 }
+#elif defined(CONFIG_ARM64)
+static int __validate_configs_arch(void)
+{
+	int res;
+
+	res = region_intersects(memmap_start, memmap_size, IORESOURCE_SYSTEM_RAM,
+				IORES_DESC_NONE);
+	if (res == REGION_INTERSECTS || res == REGION_MIXED) {
+		NVMEV_ERROR("[mem %#010lx-%#010lx] still intersects System RAM; reserve it with a no-map DTB carveout\n",
+			    memmap_start, memmap_start + memmap_size - 1);
+		return -EPERM;
+	}
+
+	return 0;
+}
 #else
 static int __validate_configs_arch(void)
 {
@@ -295,7 +315,7 @@ static void __print_perf_configs(void)
 
 static int __get_nr_entries(int dbs_idx, int queue_size)
 {
-	int diff = nvmev_vdev->dbs[dbs_idx] - nvmev_vdev->old_dbs[dbs_idx];
+	int diff = nvmev_db_read(dbs_idx) - nvmev_vdev->old_dbs[dbs_idx];
 	if (diff < 0) {
 		diff += queue_size;
 	}
@@ -341,8 +361,6 @@ static int __proc_file_read(struct seq_file *m, void *data)
 		}
 		seq_printf(m, "total: %u %u %u %llu\n", nr_in_flight, nr_dispatch, nr_dispatched,
 			   total_io);
-	} else if (strcmp(filename, "debug") == 0) {
-		/* Left for later use */
 	}
 
 	return 0;
@@ -391,8 +409,6 @@ static ssize_t __proc_file_write(struct file *file, const char __user *buf, size
 
 			memset(&sq->stat, 0x00, sizeof(sq->stat));
 		}
-	} else if (!strcmp(filename, "debug")) {
-		/* Left for later use */
 	}
 
 out:
@@ -448,7 +464,6 @@ static void NVMEV_STORAGE_INIT(struct nvmev_dev *nvmev_vdev)
 	nvmev_vdev->proc_io_units =
 		proc_create("io_units", 0664, nvmev_vdev->proc_root, &proc_file_fops);
 	nvmev_vdev->proc_stat = proc_create("stat", 0444, nvmev_vdev->proc_root, &proc_file_fops);
-	nvmev_vdev->proc_debug = proc_create("debug", 0444, nvmev_vdev->proc_root, &proc_file_fops);
 }
 
 static void NVMEV_STORAGE_FINAL(struct nvmev_dev *nvmev_vdev)
@@ -457,7 +472,6 @@ static void NVMEV_STORAGE_FINAL(struct nvmev_dev *nvmev_vdev)
 	remove_proc_entry("write_times", nvmev_vdev->proc_root);
 	remove_proc_entry("io_units", nvmev_vdev->proc_root);
 	remove_proc_entry("stat", nvmev_vdev->proc_root);
-	remove_proc_entry("debug", nvmev_vdev->proc_root);
 
 	remove_proc_entry("nvmev", NULL);
 
@@ -600,10 +614,54 @@ static void __print_base_config(void)
 			(NVMEV_VERSION & 0xff00) >> 8, (NVMEV_VERSION & 0x00ff), type);
 }
 
+static void __cleanup_nvmev(void)
+{
+	int i;
+
+	if (!nvmev_vdev)
+		return;
+
+	if (nvmev_vdev->virt_bus != NULL) {
+		pci_stop_root_bus(nvmev_vdev->virt_bus);
+		pci_remove_root_bus(nvmev_vdev->virt_bus);
+		nvmev_vdev->virt_bus = NULL;
+	}
+
+	if (dispatcher_initialized) {
+		NVMEV_DISPATCHER_FINAL(nvmev_vdev);
+		dispatcher_initialized = false;
+	}
+
+	if (io_worker_initialized) {
+		NVMEV_IO_WORKER_FINAL(nvmev_vdev);
+		io_worker_initialized = false;
+	}
+
+	if (namespace_initialized) {
+		NVMEV_NAMESPACE_FINAL(nvmev_vdev);
+		namespace_initialized = false;
+	}
+
+	if (storage_initialized) {
+		NVMEV_STORAGE_FINAL(nvmev_vdev);
+		storage_initialized = false;
+	}
+
+	if (io_using_dma)
+		ioat_dma_cleanup();
+
+	for (i = 0; i < nvmev_vdev->nr_sq; i++)
+		kfree(nvmev_vdev->sqes[i]);
+
+	for (i = 0; i < nvmev_vdev->nr_cq; i++)
+		kfree(nvmev_vdev->cqes[i]);
+
+	VDEV_FINALIZE(nvmev_vdev);
+	nvmev_vdev = NULL;
+}
+
 static int NVMeV_init(void)
 {
-	int ret = 0;
-
 	__print_base_config();
 
 	nvmev_vdev = VDEV_INIT();
@@ -615,8 +673,10 @@ static int NVMeV_init(void)
 	}
 
 	NVMEV_STORAGE_INIT(nvmev_vdev);
+	storage_initialized = true;
 
 	NVMEV_NAMESPACE_INIT(nvmev_vdev);
+	namespace_initialized = true;
 
 	if (io_using_dma) {
 		if (ioat_dma_chan_set("dma7chan0") != 0) {
@@ -632,7 +692,10 @@ static int NVMeV_init(void)
 	__print_perf_configs();
 
 	NVMEV_IO_WORKER_INIT(nvmev_vdev);
+	io_worker_initialized = true;
+
 	NVMEV_DISPATCHER_INIT(nvmev_vdev);
+	dispatcher_initialized = true;
 
 	pci_bus_add_devices(nvmev_vdev->virt_bus);
 
@@ -641,38 +704,13 @@ static int NVMeV_init(void)
 	return 0;
 
 ret_err:
-	VDEV_FINALIZE(nvmev_vdev);
+	__cleanup_nvmev();
 	return -EIO;
 }
 
 static void NVMeV_exit(void)
 {
-	int i;
-
-	if (nvmev_vdev->virt_bus != NULL) {
-		pci_stop_root_bus(nvmev_vdev->virt_bus);
-		pci_remove_root_bus(nvmev_vdev->virt_bus);
-	}
-
-	NVMEV_DISPATCHER_FINAL(nvmev_vdev);
-	NVMEV_IO_WORKER_FINAL(nvmev_vdev);
-
-	NVMEV_NAMESPACE_FINAL(nvmev_vdev);
-	NVMEV_STORAGE_FINAL(nvmev_vdev);
-
-	if (io_using_dma) {
-		ioat_dma_cleanup();
-	}
-
-	for (i = 0; i < nvmev_vdev->nr_sq; i++) {
-		kfree(nvmev_vdev->sqes[i]);
-	}
-
-	for (i = 0; i < nvmev_vdev->nr_cq; i++) {
-		kfree(nvmev_vdev->cqes[i]);
-	}
-
-	VDEV_FINALIZE(nvmev_vdev);
+	__cleanup_nvmev();
 
 	NVMEV_INFO("Virtual NVMe device closed\n");
 }

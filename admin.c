@@ -91,7 +91,8 @@ static void __nvmev_admin_create_cq(int eid)
 	nvmev_vdev->cqes[cq->qid] = cq;
 
 	dbs_idx = cq->qid * 2 + 1;
-	nvmev_vdev->dbs[dbs_idx] = nvmev_vdev->old_dbs[dbs_idx] = 0;
+	nvmev_db_write(dbs_idx, 0);
+	nvmev_vdev->old_dbs[dbs_idx] = 0;
 
 	__make_cq_entry(eid, NVME_SC_SUCCESS);
 }
@@ -153,7 +154,7 @@ static void __nvmev_admin_create_sq(int eid)
 	nvmev_vdev->sqes[sq->qid] = sq;
 
 	dbs_idx = sq->qid * 2;
-	nvmev_vdev->dbs[dbs_idx] = 0;
+	nvmev_db_write(dbs_idx, 0);
 	nvmev_vdev->old_dbs[dbs_idx] = 0;
 
 	__make_cq_entry(eid, NVME_SC_SUCCESS);
@@ -425,6 +426,8 @@ static void __nvmev_admin_identify_ctrl(int eid)
 	ctrl = prp_address(cmd->prp1);
 	memset(ctrl, 0x00, sizeof(*ctrl));
 
+	ctrl->vid = cpu_to_le16(NVMEV_VENDOR_ID);
+	ctrl->ssvid = cpu_to_le16(NVMEV_SUBSYSTEM_VENDOR_ID);
 	ctrl->nn = nvmev_vdev->nr_ns;
 	ctrl->oncs = 0; //optional command
 	ctrl->acl = 3; //minimum 4 required, 0's based value
