@@ -644,6 +644,46 @@ raise SystemExit(1)
 PY
 }
 
+show_hmb_stats() {
+    local line sram_hits hmb_hits nand_fetches avg_l2p_lat total
+
+    # hmb_cache_fini() logs this line to dmesg on rmmod
+    line="$(dmesg 2>/dev/null | grep "HMB cache stats:" | tail -1)"
+    if [ -z "$line" ]; then
+        log_warn "HMB cache stats not found in dmesg (HMB cache may be disabled or not exercised)"
+        return
+    fi
+
+    sram_hits="$(echo "$line"    | sed -n 's/.*SRAM hits=\([0-9]*\).*/\1/p')"
+    hmb_hits="$(echo "$line"     | sed -n 's/.*HMB hits=\([0-9]*\).*/\1/p')"
+    nand_fetches="$(echo "$line" | sed -n 's/.*NAND fetches=\([0-9]*\).*/\1/p')"
+    avg_l2p_lat="$(echo "$line"  | sed -n 's/.*avg_l2p_lat_ns=\([0-9]*\).*/\1/p')"
+
+    sram_hits="${sram_hits:-0}"
+    hmb_hits="${hmb_hits:-0}"
+    nand_fetches="${nand_fetches:-0}"
+    avg_l2p_lat="${avg_l2p_lat:-0}"
+    total=$(( sram_hits + hmb_hits + nand_fetches ))
+
+    echo ""
+    echo "============================================================"
+    echo " HMB Cache Statistics"
+    echo "============================================================"
+    if [ "$total" -eq 0 ]; then
+        echo "  No L2P lookups recorded (HMB cache not exercised)"
+    else
+        printf "  %-22s %10d  (%d%%)\n" "SRAM hits:"    "$sram_hits"    $(( sram_hits    * 100 / total ))
+        printf "  %-22s %10d  (%d%%)\n" "HMB hits:"     "$hmb_hits"     $(( hmb_hits     * 100 / total ))
+        printf "  %-22s %10d  (%d%%)\n" "NAND fetches:" "$nand_fetches" $(( nand_fetches * 100 / total ))
+        echo "  --------------------------------------------------"
+        printf "  %-22s %10d\n"  "Total L2P lookups:" "$total"
+        printf "  %-22s %9d%%\n" "Cache hit rate:"    $(( (sram_hits + hmb_hits) * 100 / total ))
+        printf "  %-22s %9d%%\n" "NAND miss rate:"    $(( nand_fetches * 100 / total ))
+        printf "  %-22s %9d ns\n" "Avg L2P lat/IO:"   "$avg_l2p_lat"
+    fi
+    echo "============================================================"
+}
+
 print_summary() {
     local total=0 pass=0 fail=0 key val
     echo ""
@@ -856,6 +896,7 @@ phase2_test() {
         record_result "Module unload" FAIL
     fi
 
+    show_hmb_stats
     print_summary
 }
 

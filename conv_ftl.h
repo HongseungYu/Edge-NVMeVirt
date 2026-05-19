@@ -7,13 +7,13 @@
 #include "pqueue/pqueue.h"
 #include "ssd_config.h"
 #include "ssd.h"
+#include "hmb_cache.h"
 
 struct convparams {
 	uint32_t gc_thres_lines;
 	uint32_t gc_thres_lines_high;
 	bool enable_gc_delay;
 
-	double op_area_pcent;
 	int pba_pcent; /* (physical space / logical space) * 100*/
 };
 
@@ -65,6 +65,9 @@ struct conv_ftl {
 	struct write_pointer gc_wp;
 	struct line_mgmt lm;
 	struct write_flow_control wfc;
+
+	/* 3-tier L2P cache (shared across all nr_parts instances via pointer) */
+	struct nvmev_hmb_cache *hmb_cache;
 };
 
 void conv_init_namespace(struct nvmev_ns *ns, uint32_t id, uint64_t size, void *mapped_addr,

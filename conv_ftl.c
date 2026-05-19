@@ -7,6 +7,17 @@
 #include "nvmev.h"
 #include "conv_ftl.h"
 
+/* Module parameters defined in main.c */
+extern unsigned int hmb_size_mb;
+extern unsigned int sram_size_kb;
+extern unsigned int lat_sram_ns;
+extern unsigned int lat_hmb_ns;
+extern unsigned int lat_nand_ns;
+extern unsigned int repl_policy;
+
+/* L2P entry size on real hardware (lpn 8 B + ppa 8 B) used for capacity math */
+#define L2P_ENTRY_BYTES 16U
+
 static inline bool last_pg_in_wordline(struct conv_ftl *conv_ftl, struct ppa *ppa)
 {
 	struct ssdparams *spp = &conv_ftl->ssd->sp;
@@ -32,6 +43,31 @@ static inline void set_maptbl_ent(struct conv_ftl *conv_ftl, uint64_t lpn, struc
 {
 	NVMEV_ASSERT(lpn < conv_ftl->ssd->sp.tt_pgs);
 	conv_ftl->maptbl[lpn] = *ppa;
+}
+
+/*
+ * Wrapper around get_maptbl_ent() that additionally simulates the latency of
+ * looking up the L2P entry through the 3-tier cache (SRAM → HMB → NAND).
+ * The ground-truth PPA is always taken from maptbl[]; the cache only models
+ * lookup overhead.  The simulated latency in nanoseconds is accumulated into
+ * *lat_ns (caller initialises it to zero).
+ *
+ * @local_lpn:  partition-local page index used to index maptbl[]
+ * @global_lpn: device-wide logical page number used as the cache key; must be
+ *              unique across all partitions so that e.g. partition-0 lpn 0 and
+ *              partition-1 lpn 0 do not collide in the shared cache.
+ */
+static inline struct ppa get_maptbl_ent_cached(struct conv_ftl *conv_ftl,
+					       uint64_t local_lpn,
+					       uint64_t global_lpn,
+					       uint64_t *lat_ns)
+{
+	struct ppa ppa = get_maptbl_ent(conv_ftl, local_lpn);
+
+	if (conv_ftl->hmb_cache && lat_ns)
+		*lat_ns += hmb_cache_lookup(conv_ftl->hmb_cache, global_lpn, &ppa);
+
+	return ppa;
 }
 
 static uint64_t ppa2pgidx(struct conv_ftl *conv_ftl, struct ppa *ppa)
@@ -366,11 +402,10 @@ static void conv_remove_ftl(struct conv_ftl *conv_ftl)
 
 static void conv_init_params(struct convparams *cpp)
 {
-	cpp->op_area_pcent = OP_AREA_PERCENT;
 	cpp->gc_thres_lines = 2; /* Need only two lines.(host write, gc)*/
 	cpp->gc_thres_lines_high = 2; /* Need only two lines.(host write, gc)*/
 	cpp->enable_gc_delay = 1;
-	cpp->pba_pcent = (int)((1 + cpp->op_area_pcent) * 100);
+	cpp->pba_pcent = 100 + OP_AREA_PERCENT;
 }
 
 void conv_init_namespace(struct nvmev_ns *ns, uint32_t id, uint64_t size, void *mapped_addr,
@@ -404,6 +439,33 @@ void conv_init_namespace(struct nvmev_ns *ns, uint32_t id, uint64_t size, void *
 		conv_ftls[i].ssd->write_buffer = conv_ftls[0].ssd->write_buffer;
 	}
 
+	/* Allocate the shared 3-tier L2P cache and point every partition at it. */
+	if (sram_size_kb > 0 || hmb_size_mb > 0) {
+		uint32_t sram_entries = (uint32_t)((uint64_t)sram_size_kb * 1024 / L2P_ENTRY_BYTES);
+		uint32_t hmb_entries  = (uint32_t)((uint64_t)hmb_size_mb  * 1024 * 1024 / L2P_ENTRY_BYTES);
+		struct nvmev_hmb_cache *cache;
+		int ret;
+
+		cache = kmalloc(sizeof(*cache), GFP_KERNEL);
+		if (!cache) {
+			NVMEV_ERROR("HMB cache: kmalloc failed, cache disabled\n");
+			goto skip_cache;
+		}
+
+		ret = hmb_cache_init(cache, sram_entries, hmb_entries,
+				     lat_sram_ns, lat_hmb_ns, lat_nand_ns,
+				     (enum hmb_repl_policy)repl_policy);
+		if (ret) {
+			NVMEV_ERROR("HMB cache: init failed (%d), cache disabled\n", ret);
+			kfree(cache);
+			goto skip_cache;
+		}
+
+		for (i = 0; i < nr_parts; i++)
+			conv_ftls[i].hmb_cache = cache;
+	}
+skip_cache:
+
 	ns->id = id;
 	ns->csi = NVME_CSI_NVM;
 	ns->nr_parts = nr_parts;
@@ -424,6 +486,14 @@ void conv_remove_namespace(struct nvmev_ns *ns)
 	struct conv_ftl *conv_ftls = (struct conv_ftl *)ns->ftls;
 	const uint32_t nr_parts = SSD_PARTITIONS;
 	uint32_t i;
+
+	/* Release the shared HMB cache (all partitions point to the same object). */
+	if (conv_ftls[0].hmb_cache) {
+		hmb_cache_fini(conv_ftls[0].hmb_cache);
+		kfree(conv_ftls[0].hmb_cache);
+		for (i = 0; i < nr_parts; i++)
+			conv_ftls[i].hmb_cache = NULL;
+	}
 
 	/* PCIe, Write buffer are shared by all instances*/
 	for (i = 1; i < nr_parts; i++) {
@@ -845,6 +915,8 @@ static bool conv_read(struct nvmev_ns *ns, struct nvmev_request *req, struct nvm
 	uint64_t lpn;
 	uint64_t nsecs_start = req->nsecs_start;
 	uint64_t nsecs_completed, nsecs_latest = nsecs_start;
+	uint64_t l2p_lat = 0;
+	uint64_t l2p_now;
 	uint32_t xfer_size, i;
 	uint32_t nr_parts = ns->nr_parts;
 
@@ -870,18 +942,34 @@ static bool conv_read(struct nvmev_ns *ns, struct nvmev_request *req, struct nvm
 		srd.stime += spp->fw_rd_lat;
 	}
 
+	/* Each partition looks up L2P independently; l2p_now is reset per
+	 * partition so that different partitions' lookups are not serialised.
+	 * Within one partition, lookups are serial: l2p_now advances with each
+	 * lookup and is used as the NAND start time for that lookup's page.
+	 *
+	 * l2p_for_prev is snapshotted BEFORE the current LPN's lookup so that
+	 * the NAND read for the PREVIOUS flash-page group is not delayed by the
+	 * lookup that merely detected the page boundary. */
 	for (i = 0; (i < nr_parts) && (start_lpn <= end_lpn); i++, start_lpn++) {
+		l2p_now = srd.stime; /* reset: each partition starts from the same base */
 		conv_ftl = &conv_ftls[start_lpn % nr_parts];
 		xfer_size = 0;
+		/* No latency charged here: the inner loop re-fetches this same LPN
+		 * on its first iteration, which is where the L2P latency is counted. */
 		prev_ppa = get_maptbl_ent(conv_ftl, start_lpn / nr_parts);
 
 		/* normal IO read path */
 		for (lpn = start_lpn; lpn <= end_lpn; lpn += nr_parts) {
 			uint64_t local_lpn;
+			uint64_t prev_lat;
+			uint64_t l2p_for_prev;
 			struct ppa cur_ppa;
 
 			local_lpn = lpn / nr_parts;
-			cur_ppa = get_maptbl_ent(conv_ftl, local_lpn);
+			prev_lat = l2p_lat;
+			l2p_for_prev = l2p_now; /* snapshot before this lookup */
+			cur_ppa = get_maptbl_ent_cached(conv_ftl, local_lpn, lpn, &l2p_lat);
+			l2p_now += l2p_lat - prev_lat;
 			if (!mapped_ppa(&cur_ppa) || !valid_ppa(conv_ftl, &cur_ppa)) {
 				NVMEV_DEBUG_VERBOSE("lpn 0x%llx not mapped to valid ppa\n", local_lpn);
 				NVMEV_DEBUG_VERBOSE("Invalid ppa,ch:%d,lun:%d,blk:%d,pl:%d,pg:%d\n",
@@ -900,6 +988,9 @@ static bool conv_read(struct nvmev_ns *ns, struct nvmev_request *req, struct nvm
 			if (xfer_size > 0) {
 				srd.xfer_size = xfer_size;
 				srd.ppa = &prev_ppa;
+				/* Use the snapshot: prev_ppa's group is fully resolved at
+				 * l2p_for_prev, before cur_ppa's lookup was charged. */
+				srd.stime = l2p_for_prev;
 				nsecs_completed = ssd_advance_nand(conv_ftl->ssd, &srd);
 				nsecs_latest = max(nsecs_completed, nsecs_latest);
 			}
@@ -912,6 +1003,7 @@ static bool conv_read(struct nvmev_ns *ns, struct nvmev_request *req, struct nvm
 		if (xfer_size > 0) {
 			srd.xfer_size = xfer_size;
 			srd.ppa = &prev_ppa;
+			srd.stime = l2p_now;
 			nsecs_completed = ssd_advance_nand(conv_ftl->ssd, &srd);
 			nsecs_latest = max(nsecs_completed, nsecs_latest);
 		}
@@ -919,6 +1011,10 @@ static bool conv_read(struct nvmev_ns *ns, struct nvmev_request *req, struct nvm
 
 	ret->nsecs_target = nsecs_latest;
 	ret->status = NVME_SC_SUCCESS;
+
+	if (conv_ftls[0].hmb_cache && l2p_lat > 0)
+		hmb_cache_record_io(conv_ftls[0].hmb_cache, l2p_lat);
+
 	return true;
 }
 
@@ -942,6 +1038,7 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 
 	uint64_t nsecs_latest;
 	uint64_t nsecs_xfer_completed;
+	uint64_t l2p_lat = 0; /* accumulated L2P lookup latency */
 	uint32_t allocated_buf_size;
 
 	struct nand_cmd swr = {
@@ -975,8 +1072,8 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 
 		conv_ftl = &conv_ftls[lpn % nr_parts];
 		local_lpn = lpn / nr_parts;
-		ppa = get_maptbl_ent(
-			conv_ftl, local_lpn); // Check whether the given LPN has been written before
+		ppa = get_maptbl_ent_cached(conv_ftl, local_lpn, lpn,
+					    &l2p_lat); /* check if LPN was written before */
 		if (mapped_ppa(&ppa)) {
 			/* update old page information first */
 			mark_page_invalid(conv_ftl, &ppa);
@@ -991,6 +1088,9 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 		NVMEV_DEBUG("%s: got new ppa %lld, ", __func__, ppa2pgidx(conv_ftl, &ppa));
 		/* update rmap */
 		set_rmap_ent(conv_ftl, local_lpn, &ppa);
+		/* refresh the cache with the new mapping so reads hit rather than miss */
+		if (conv_ftl->hmb_cache)
+			hmb_cache_update(conv_ftl->hmb_cache, lpn, &ppa);
 
 		mark_page_valid(conv_ftl, &ppa);
 
@@ -1012,14 +1112,18 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 		check_and_refill_write_credit(conv_ftl);
 	}
 
+	/* L2P lookup on the write path is only to find the old PPA for invalidation;
+	 * it overlaps with write-buffer fill / NAND programming and is not on the
+	 * host-visible critical path. */
 	if ((cmd->rw.control & NVME_RW_FUA) || (spp->write_early_completion == 0)) {
-		/* Wait all flash operations */
 		ret->nsecs_target = nsecs_latest;
 	} else {
-		/* Early completion */
 		ret->nsecs_target = nsecs_xfer_completed;
 	}
 	ret->status = NVME_SC_SUCCESS;
+
+	if (conv_ftls[0].hmb_cache && l2p_lat > 0)
+		hmb_cache_record_io(conv_ftls[0].hmb_cache, l2p_lat);
 
 	return true;
 }

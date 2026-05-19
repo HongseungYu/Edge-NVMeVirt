@@ -73,6 +73,14 @@ static unsigned int write_trailing = 0;
 static unsigned int nr_io_units = 8;
 static unsigned int io_unit_shift = 12;
 
+/* HMB L2P cache simulation parameters */
+unsigned int hmb_size_mb  = 16;
+unsigned int sram_size_kb = 256;
+unsigned int lat_sram_ns  = 100;
+unsigned int lat_hmb_ns   = 1000;
+unsigned int lat_nand_ns  = 30000;
+unsigned int repl_policy  = 0; /* 0=LRU, 1=RANDOM */
+
 static char *cpus;
 static bool storage_initialized = false;
 static bool namespace_initialized = false;
@@ -115,6 +123,19 @@ module_param(io_unit_shift, uint, 0444);
 MODULE_PARM_DESC(io_unit_shift, "Size of each I/O unit (2^)");
 module_param(cpus, charp, 0444);
 MODULE_PARM_DESC(cpus, "CPU list for process, completion(int.) threads, Seperated by Comma(,)");
+
+module_param(hmb_size_mb, uint, 0644);
+MODULE_PARM_DESC(hmb_size_mb, "HMB tier size in MiB (0 = disabled, default 16)");
+module_param(sram_size_kb, uint, 0644);
+MODULE_PARM_DESC(sram_size_kb, "SRAM tier size in KiB (0 = disabled, default 256)");
+module_param(lat_sram_ns, uint, 0644);
+MODULE_PARM_DESC(lat_sram_ns, "L2P lookup latency for SRAM hit in ns (default 100)");
+module_param(lat_hmb_ns, uint, 0644);
+MODULE_PARM_DESC(lat_hmb_ns, "L2P lookup latency for HMB hit in ns (default 1000)");
+module_param(lat_nand_ns, uint, 0644);
+MODULE_PARM_DESC(lat_nand_ns, "L2P lookup latency for NAND miss in ns (default 30000)");
+module_param(repl_policy, uint, 0644);
+MODULE_PARM_DESC(repl_policy, "Cache replacement policy: 0=LRU (default), 1=RANDOM");
 
 // Returns true if an event is processed
 static bool nvmev_proc_dbs(void)
