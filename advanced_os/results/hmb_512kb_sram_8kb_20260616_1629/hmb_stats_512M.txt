@@ -1,0 +1,1 @@
+[  573.933416] NVMeVirt: HMB cache stats: SRAM hits=223  HMB hits=427115  NAND fetches=132839  avg_l2p_lat_ns=23165

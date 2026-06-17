@@ -1,0 +1,14 @@
+unknown config - QD=1  locality sweep   (6 runs over 6 thetas)
+   theta |   IOPS mean+/-std |  mean us |   p99 us |  hit(rel)
+--------------------------------------------------------------
+ uniform |       7734+/-   0 |    125.5 |    146.4 |      0.0%
+     0.2 |       8728+/-   0 |    110.3 |    146.4 |     45.5%
+     0.4 |       9031+/-   0 |    106.9 |    146.4 |     55.4%
+     0.6 |       9122+/-   0 |    105.0 |    146.4 |     61.1%
+     0.8 |       9915+/-   0 |     97.1 |    144.4 |     84.7%
+    0.99 |      10378+/-   0 |     92.0 |    146.4 |    100.0%
+
+NOTE: hit rate is RELATIVE (normalized to this sweep's min/max mean).
+      Pass --t-hit and --t-miss (us) from the span-sweep calibration for an absolute hit rate.
+
+Saved: advanced_os/results/hmb_on_loc_20260617_1216/locality_qd1.png

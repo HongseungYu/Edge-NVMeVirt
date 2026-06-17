@@ -110,8 +110,17 @@ static void tier_insert(struct hmb_cache_tier *tier, uint64_t lpn,
 			 * uniform random index gives a uniform random victim.
 			 */
 			e = &tier->pool[get_random_u32() % tier->capacity];
+		} else if (policy == HMB_REPL_MRU) {
+			/* MRU: evict the most-recently-used entry (head). */
+			e = list_first_entry(&tier->lru_list,
+					     struct hmb_cache_entry, lru_link);
 		} else {
-			/* LRU: evict the tail of the LRU list. */
+			/*
+			 * LRU / FIFO: evict from the tail.
+			 * For LRU the tail is the least-recently-used entry.
+			 * For FIFO the list is never reordered on access, so
+			 * the tail is always the oldest-inserted entry.
+			 */
 			e = list_last_entry(&tier->lru_list,
 					    struct hmb_cache_entry, lru_link);
 		}
@@ -126,6 +135,17 @@ static void tier_insert(struct hmb_cache_tier *tier, uint64_t lpn,
 	bucket = hash_64(lpn, tier->htable_bits);
 	hlist_add_head(&e->hash_link, &tier->htable[bucket]);
 	list_add(&e->lru_link, &tier->lru_list); /* MRU position */
+}
+
+static const char *policy_name(enum hmb_repl_policy p)
+{
+	switch (p) {
+	case HMB_REPL_LRU:    return "LRU";
+	case HMB_REPL_RANDOM: return "RANDOM";
+	case HMB_REPL_MRU:    return "MRU";
+	case HMB_REPL_FIFO:   return "FIFO";
+	default:              return "unknown";
+	}
 }
 
 /* ------------------------------------------------------------------ */
@@ -170,8 +190,7 @@ int hmb_cache_init(struct nvmev_hmb_cache *cache, uint32_t sram_entries,
 		   "NAND miss %llu ns, policy=%s\n",
 		   sram_entries, lat_sram_ns,
 		   hmb_entries, lat_hmb_ns,
-		   lat_nand_ns,
-		   policy == HMB_REPL_LRU ? "LRU" : "RANDOM");
+		   lat_nand_ns, policy_name(policy));
 	return 0;
 }
 
@@ -207,7 +226,9 @@ uint64_t hmb_cache_lookup(struct nvmev_hmb_cache *cache, uint64_t lpn,
 	if (cache->sram.capacity > 0) {
 		e = tier_lookup(&cache->sram, lpn);
 		if (e) {
-			tier_promote(&cache->sram, e);
+			/* FIFO maintains insertion order; never reorder on hit. */
+			if (cache->repl_policy != HMB_REPL_FIFO)
+				tier_promote(&cache->sram, e);
 			cache->sram_hits++;
 			lat = cache->lat_sram_ns;
 			goto out;
@@ -223,8 +244,9 @@ uint64_t hmb_cache_lookup(struct nvmev_hmb_cache *cache, uint64_t lpn,
 			/* Promote to SRAM so the next access is faster. */
 			if (cache->sram.capacity > 0)
 				tier_insert(&cache->sram, lpn, ppa, cache->repl_policy);
-			/* Keep HMB entry at MRU to reflect the recent access. */
-			tier_promote(&cache->hmb, e);
+			/* Reorder HMB entry to reflect recent access (not for FIFO). */
+			if (cache->repl_policy != HMB_REPL_FIFO)
+				tier_promote(&cache->hmb, e);
 			goto out;
 		}
 	}
@@ -251,18 +273,20 @@ void hmb_cache_update(struct nvmev_hmb_cache *cache, uint64_t lpn,
 
 	spin_lock_irqsave(&cache->lock, flags);
 
-	/* Update SRAM in-place if present; keep it at MRU. */
+	/* Update SRAM in-place if present; keep it at MRU (unless FIFO). */
 	if (cache->sram.capacity > 0) {
 		e = tier_lookup(&cache->sram, lpn);
 		if (e) {
 			e->ppa = *ppa;
-			tier_promote(&cache->sram, e);
+			if (cache->repl_policy != HMB_REPL_FIFO)
+				tier_promote(&cache->sram, e);
 			/* Also refresh the HMB shadow entry if it still exists. */
 			if (cache->hmb.capacity > 0) {
 				e = tier_lookup(&cache->hmb, lpn);
 				if (e) {
 					e->ppa = *ppa;
-					tier_promote(&cache->hmb, e);
+					if (cache->repl_policy != HMB_REPL_FIFO)
+						tier_promote(&cache->hmb, e);
 				}
 			}
 			goto out;
@@ -274,7 +298,8 @@ void hmb_cache_update(struct nvmev_hmb_cache *cache, uint64_t lpn,
 		e = tier_lookup(&cache->hmb, lpn);
 		if (e) {
 			e->ppa = *ppa;
-			tier_promote(&cache->hmb, e);
+			if (cache->repl_policy != HMB_REPL_FIFO)
+				tier_promote(&cache->hmb, e);
 			if (cache->sram.capacity > 0)
 				tier_insert(&cache->sram, lpn, ppa, cache->repl_policy);
 			goto out;

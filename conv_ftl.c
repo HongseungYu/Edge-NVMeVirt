@@ -9,14 +9,15 @@
 
 /* Module parameters defined in main.c */
 extern unsigned int hmb_size_mb;
+extern unsigned int hmb_size_kb;  /* overrides hmb_size_mb when non-zero */
 extern unsigned int sram_size_kb;
 extern unsigned int lat_sram_ns;
 extern unsigned int lat_hmb_ns;
 extern unsigned int lat_nand_ns;
 extern unsigned int repl_policy;
 
-/* L2P entry size on real hardware (lpn 8 B + ppa 8 B) used for capacity math */
-#define L2P_ENTRY_BYTES 16U
+/* L2P entry size on real hardware: 4 B PPA (LPN is implicit from array index) */
+#define L2P_ENTRY_BYTES 4U
 
 static inline bool last_pg_in_wordline(struct conv_ftl *conv_ftl, struct ppa *ppa)
 {
@@ -440,29 +441,35 @@ void conv_init_namespace(struct nvmev_ns *ns, uint32_t id, uint64_t size, void *
 	}
 
 	/* Allocate the shared 3-tier L2P cache and point every partition at it. */
-	if (sram_size_kb > 0 || hmb_size_mb > 0) {
+	{
+		uint64_t hmb_bytes = hmb_size_kb > 0
+			? (uint64_t)hmb_size_kb * 1024
+			: (uint64_t)hmb_size_mb * 1024 * 1024;
 		uint32_t sram_entries = (uint32_t)((uint64_t)sram_size_kb * 1024 / L2P_ENTRY_BYTES);
-		uint32_t hmb_entries  = (uint32_t)((uint64_t)hmb_size_mb  * 1024 * 1024 / L2P_ENTRY_BYTES);
-		struct nvmev_hmb_cache *cache;
-		int ret;
+		uint32_t hmb_entries  = (uint32_t)(hmb_bytes / L2P_ENTRY_BYTES);
 
-		cache = kmalloc(sizeof(*cache), GFP_KERNEL);
-		if (!cache) {
-			NVMEV_ERROR("HMB cache: kmalloc failed, cache disabled\n");
-			goto skip_cache;
+		if (sram_size_kb > 0 || hmb_bytes > 0) {
+			struct nvmev_hmb_cache *cache;
+			int ret;
+
+			cache = kmalloc(sizeof(*cache), GFP_KERNEL);
+			if (!cache) {
+				NVMEV_ERROR("HMB cache: kmalloc failed, cache disabled\n");
+				goto skip_cache;
+			}
+
+			ret = hmb_cache_init(cache, sram_entries, hmb_entries,
+					     lat_sram_ns, lat_hmb_ns, lat_nand_ns,
+					     (enum hmb_repl_policy)repl_policy);
+			if (ret) {
+				NVMEV_ERROR("HMB cache: init failed (%d), cache disabled\n", ret);
+				kfree(cache);
+				goto skip_cache;
+			}
+
+			for (i = 0; i < nr_parts; i++)
+				conv_ftls[i].hmb_cache = cache;
 		}
-
-		ret = hmb_cache_init(cache, sram_entries, hmb_entries,
-				     lat_sram_ns, lat_hmb_ns, lat_nand_ns,
-				     (enum hmb_repl_policy)repl_policy);
-		if (ret) {
-			NVMEV_ERROR("HMB cache: init failed (%d), cache disabled\n", ret);
-			kfree(cache);
-			goto skip_cache;
-		}
-
-		for (i = 0; i < nr_parts; i++)
-			conv_ftls[i].hmb_cache = cache;
 	}
 skip_cache:
 

@@ -1,0 +1,30 @@
+## label
+hmb_2mb_sram_32kb_full
+## module
+/home/nxc/AdvancedOS26/nvmevirt/advanced_os/../nvmev.ko
+## date
+2026-06-14T14:45:33+09:00
+## hmb_size_kb
+2048
+## sram_size_kb
+32
+## lat_sram_ns
+100
+## lat_hmb_ns
+3000
+## lat_nand_ns
+40000
+## repl_policy
+0
+## qd
+1
+## runs
+1
+## runtime_s
+30
+## span_list
+64M,256M,512M,1G,2G,3G,4G
+## sram_cov_mb
+32
+## hmb_cov_mb
+2048

@@ -261,6 +261,21 @@ def measure_fio(ns_path, rw, bs, iodepth, runtime):
     }
 
 
+def precondition_device(ns_path, size_mb):
+    """Sequential write to populate all L2P mappings before a read workload.
+
+    Without this, insmod initialises every LPN to UNMAPPED_PPA, so fio randread
+    hits the !mapped_ppa() branch in conv_read() and skips ssd_advance_nand()
+    entirely — making throughput unrealistically high and NAND latency invisible.
+    """
+    r = run(
+        f'fio --filename={ns_path} --direct=1 --rw=write --bs=128k'
+        f' --size={size_mb}M --name=precond --output-format=json',
+        check=False,
+    )
+    return r.returncode == 0
+
+
 # ── sweep ─────────────────────────────────────────────────────────────────────
 
 def sweep_param(param, values, state, args):
@@ -313,8 +328,17 @@ def sweep_param(param, values, state, args):
 
         # ── fio ───────────────────────────────────────────────────────────────
         if use_fio:
-            fio = measure_fio(ns, args.fio_rw, args.fio_bs,
-                              args.fio_iodepth, args.fio_runtime)
+            # dd write (when use_dd) already populates L2P; otherwise pre-condition
+            # so that read workloads don't silently skip ssd_advance_nand().
+            skip_fio = False
+            if not use_dd and 'read' in args.fio_rw:
+                print('    pre-conditioning (sequential write) …', flush=True)
+                if not precondition_device(ns, args.dd_size):
+                    print('    pre-condition failed – fio skipped', flush=True)
+                    skip_fio = True
+
+            fio = None if skip_fio else measure_fio(
+                ns, args.fio_rw, args.fio_bs, args.fio_iodepth, args.fio_runtime)
             if fio:
                 rec.update({
                     'fio_read_gbps':   fio['read_gbps'],

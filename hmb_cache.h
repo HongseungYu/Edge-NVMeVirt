@@ -12,6 +12,8 @@
 enum hmb_repl_policy {
 	HMB_REPL_LRU    = 0,
 	HMB_REPL_RANDOM = 1,
+	HMB_REPL_MRU    = 2,  /* evict most-recently-used; useful for sequential scans */
+	HMB_REPL_FIFO   = 3,  /* evict oldest-inserted; no reorder on hit */
 };
 
 /*
@@ -21,7 +23,7 @@ enum hmb_repl_policy {
 struct hmb_cache_entry {
 	uint64_t lpn;
 	struct ppa ppa;
-	struct list_head lru_link;   /* MRU at head, LRU at tail */
+	struct list_head lru_link;   /* MRU at head, oldest at tail; for FIFO = insertion order */
 	struct hlist_node hash_link;
 };
 
