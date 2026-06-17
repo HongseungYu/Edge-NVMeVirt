@@ -1,0 +1,22 @@
+## date
+2026-06-17T16:40:31+09:00
+## span_mb
+8
+## loops
+20
+## iosize_mb
+160
+## zipf_theta
+0.99
+## seed
+42
+## hmb_size_kb
+1024
+## sram_size_kb
+32
+## lat_sram_ns
+100
+## lat_hmb_ns
+2000
+## lat_nand_ns
+59000

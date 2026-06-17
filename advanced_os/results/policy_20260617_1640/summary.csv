@@ -1,0 +1,6 @@
+policy,pattern,hit_rate,read_iops,clat_mean_us
+lru,cyclic,0.9502,11416,83.7
+lru,recency,0.9502,11112,85.4
+lru,uniform,0.9502,11340,84.1
+random,cyclic,0.9502,11237,84.5
+random,recency,0.9502,11353,84.2
