@@ -1,156 +1,98 @@
-# NVMeVirt
+# Edge-NVMeVirt
 
-## Introduction
+**Extending NVMeVirt for Edge Storage Research**
 
-NVMeVirt is a versatile software-defined virtual NVMe device. It is implemented as a Linux kernel module providing the system with a virtual NVMe device of various kinds. Currently, NVMeVirt supports conventional SSDs, NVM SSDs, ZNS SSDs, etc. The device is emulated at the PCI layer, presenting a native NVMe device to the entire system. Thus, NVMeVirt has the capability not only to function as a standard storage device, but also to be utilized in advanced storage configurations, such as NVMe-oF target offloading, kernel bypassing, and PCI peer-to-peer communication.
+Hongseung Yu, Hyunah Kim, Minsung Kim — Seoul National University
 
-Further details on the design and implementation of NVMeVirt can be found in the following papers.
-- [NVMeVirt: A Versatile Software-defined Virtual NVMe Device (FAST 2023)](https://www.usenix.org/conference/fast23/presentation/kim-sang-hoon)
-- [Empowering Storage Systems Research with NVMeVirt: A Comprehensive NVMe Device Emulator (Transactions on Storage 2023)](https://dl.acm.org/doi/full/10.1145/3625006)
+> Term project for **Advanced Operating Systems (4190.568), Spring 2026**, Seoul National University
+> ([course page](https://csl.snu.ac.kr/courses/4190.568/2026-1/)).
+>
+> Based on [NVMeVirt](https://github.com/snu-csl/nvmevirt) by SNU CSL ([FAST '23](https://www.usenix.org/conference/fast23/presentation/kim-sang-hoon)).
 
-Please feel free to contact us at [nvmevirt@gmail.com](mailto:nvmevirt@gmail.com) if you have any questions or suggestions. Also you can raise an issue anytime for bug reports or discussions.
+## Overview
 
-We encourage you to cite our paper at FAST 2023 as follows:
+NVMeVirt is a software-defined virtual NVMe SSD implemented as a Linux kernel module. It was built for x86 hosts and server-class SSDs, so it does not match edge storage:
+
+- **Host side:** edge platforms are ARM-based SoCs, but NVMeVirt depends on x86-only boot and interrupt mechanisms.
+- **Device side:** edge SSDs are usually **DRAM-less**. They cache only part of the L2P mapping table in controller SRAM and rely on the NVMe **Host Memory Buffer (HMB)**. NVMeVirt assumes the whole L2P table is in on-device DRAM and that lookups are free.
+
+Edge-NVMeVirt addresses both. It ports NVMeVirt to ARM64 and models the HMB-based L2P translation path of DRAM-less SSDs. We evaluated it on a **Jetson Orin Nano** against a real DRAM-less SSD (FORESEE XP1000, 128 GB).
+
+## What's New
+
+### 1. ARM64 port
+
+The core emulation logic is unchanged. Only the platform bring-up path was reworked:
+
+- **Reserved backing memory:** uses a Device Tree `reserved-memory` node (`no-map`) in place of x86 `memmap=` / E820.
+- **Synthetic MSI-X delivery:** a software parent IRQ domain plus a PCI-MSI child domain on a synthetic root bus. Completions are delivered through `generic_handle_irq()`, replacing the x86 APIC path.
+- **Memory attributes:** the BAR, doorbells and MSI-X table are mapped as MMIO (`ioremap`, `readl`/`writel`). The data backing store stays normal write-back memory.
+
+Details: [`advanced_os/arm64_porting.md`](advanced_os/arm64_porting.md)
+
+### 2. HMB-aware L2P translation cache
+
+<p align="center"><img src="docs/figures/fig2_architecture.png" width="480"></p>
+
+Each read resolves its mapping through three tiers: **controller SRAM → HMB (host DRAM over PCIe) → NAND**. Each tier charges its own latency.
+
+- Two-level cache (SRAM, HMB) at translation-page granularity: one entry covers 1,024 LPNs, or 4 MB of logical space.
+- On an SRAM miss with an HMB hit, the entry is promoted to SRAM. On a full miss, the mapping page is fetched from NAND and inserted into HMB.
+- Translation delay advances the request's timestamp *before* NAND operations are scheduled. This keeps NVMeVirt's parallel execution model intact.
+- With `hmb_size_mb=0`, the model falls back to an SRAM → NAND path (HMB off).
+- Replacement policies: **LRU, MRU, FIFO, Random**.
+
+Module parameters:
+
+| Parameter | Description |
+|---|---|
+| `sram_size_kb` | SRAM tier capacity |
+| `hmb_size_mb` / `hmb_size_kb` | HMB tier capacity (0 = HMB disabled) |
+| `lat_sram_ns`, `lat_hmb_ns`, `lat_nand_ns` | Per-tier L2P lookup latency |
+| `repl_policy` | 0 = LRU, 1 = Random, 2 = MRU, 3 = FIFO |
+
+```bash
+sudo insmod nvmev.ko memmap_start=<addr> memmap_size=<size> cpus=<list> \
+     sram_size_kb=32 hmb_size_mb=1 repl_policy=0
+```
+
+The implementation is in `hmb_cache.c`/`hmb_cache.h`, with hooks in `conv_ftl.c`. Benchmark scripts are in [`advanced_os/`](advanced_os/).
+
+## Results
+
+**Setup:** Jetson Orin Nano (16 GB). All capacities are scaled by 1/64 relative to the target device: a 2 GB virtual SSD, 32 KB SRAM and 1 MB HMB. This keeps the device's ~50% HMB-to-L2P coverage ratio. Workloads are fio 4 KB random reads with `direct=1` at QD1.
+
+### Fidelity against a real DRAM-less SSD
+
+![Fidelity](docs/figures/fig4_fidelity.png)
+
+- **(a) HMB off:** p99 latency steps up once the span exceeds SRAM coverage. The emulator reproduces the cliff at the same normalized span.
+- **(b) HMB on:** HMB absorbs SRAM misses, so latency stays flat until the span outgrows HMB coverage. Both platforms show this delayed cliff. On the emulator it is a *prediction*, because the HMB latency was calibrated independently.
+- **(c) Locality:** as Zipf skew increases, LRU keeps hot entries and mean latency falls, tracking the device's trend.
+- **Remaining gaps:**
+  - The real device has a higher post-cliff latency, likely from a two-level mapping table on the device.
+  - Its HMB cliff comes earlier, likely because part of the HMB is reserved for firmware.
+
+### Exploring the design space
+
+![Design space](docs/figures/fig5_design_space.png)
+
+- **(a) HMB size sweep:** HMB size is a fixed on/off switch on the real device. In the emulator, the coverage cliff shifts in proportion to HMB size.
+- **(b) Replacement policy:** on a cyclic loop, MRU has the best hit rate. Under a recency-skewed (Zipf 0.99) workload, the order reverses to LRU > FIFO > MRU.
+
+## Building & Usage
+
+The build and setup follow upstream NVMeVirt. See the [original README](https://github.com/snu-csl/nvmevirt#installation). For ARM64, reserve backing memory through the Device Tree instead of `memmap=`. `advanced_os/verify_nvmev_arm64.sh` automates the DTB patch and the load/IO verification.
+
+## Acknowledgements
+
+This project builds on [NVMeVirt](https://github.com/snu-csl/nvmevirt) (GPL-2.0):
+
 ```
 @InProceedings{NVMeVirt:FAST23,
-  author = {Sang-Hoon Kim and Jaehoon Shim and Euidong Lee and Seongyeop Jeong and Ilkueon Kang and Jin-Soo Kim},
-  title = {{NVMeVirt}: A Versatile Software-defined Virtual {NVMe} Device},
+  author    = {Sang-Hoon Kim and Jaehoon Shim and Euidong Lee and Seongyeop Jeong and Ilkueon Kang and Jin-Soo Kim},
+  title     = {{NVMeVirt}: A Versatile Software-defined Virtual {NVMe} Device},
   booktitle = {Proceedings of the 21st USENIX Conference on File and Storage Technologies (USENIX FAST)},
-  address = {Santa Clara, CA},
-  month = {February},
-  year = {2023},
+  year      = {2023},
 }
 ```
-
-
-## Installation
-
-### Linux kernel requirement
-
-The recommended Linux kernel version is v5.15.x and higher (tested on Linux vanilla kernel v5.15.37 and Ubuntu kernel v5.15.0-58-generic).
-
-### Reserving physical memory
-
-A part of the main memory should be reserved for the storage of the emulated NVMe device. To reserve a chunk of physical memory, add the following option to `GRUB_CMDLINE_LINUX` in `/etc/default/grub` as follows:
-
-```bash
-GRUB_CMDLINE_LINUX="memmap=64G\\\$128G"
-```
-
-This example will reserve 64GiB of physical memory chunk (out of the total 192GiB physical memory) starting from the 128GiB memory offset. You may need to adjust those values depending on the available physical memory size and the desired storage capacity.
-
-After changing the `/etc/default/grub` file, you are required to run the following commands to update `grub` and reboot your system.
-
-```bash
-$ sudo update-grub
-$ sudo reboot
-```
-
-### Compiling `nvmevirt`
-
-Please download the latest version of `nvmevirt` from Github:
-
-```bash
-$ git clone https://github.com/snu-csl/nvmevirt
-```
-
-`nvmevirt` is implemented as a Linux kernel module. Thus, the kernel headers should be installed in the `/lib/modules/$(shell uname -r)` directory to compile `nvmevirt`.
-
-Currently, you need to select the target device type by manually editing the `Kbuild`. You may find the following lines in the `Kbuild`, which imply that NVMeVirt is currently configured for emulating NVM(Non-Volatile Memory) SSD (such as Intel Optane SSD). You may uncomment other one to change the target device type. Note that you can select one device type at a time.
-
-```Makefile
-# Select one of the targets to build
-CONFIG_NVMEVIRT_NVM := y
-#CONFIG_NVMEVIRT_SSD := y
-#CONFIG_NVMEVIRT_ZNS := y
-#CONFIG_NVMEVIRT_KV := y
-```
-
-You may find the detailed configuration parameters for conventional SSD and ZNS SSD from `ssd_config.h`.
-
-Build the kernel module by running the `make` command in the `nvmevirt` source directory.
-```bash
-$ make
-make -C /lib/modules/5.15.37/build M=/path/to/nvmev modules
-make[1]: Entering directory '/path/to/linux-5.15.37'
-  CC [M]  /path/to/nvmev/main.o
-  CC [M]  /path/to/nvmev/pci.o
-  CC [M]  /path/to/nvmev/admin.o
-  CC [M]  /path/to/nvmev/io.o
-  CC [M]  /path/to/nvmev/dma.o
-  CC [M]  /path/to/nvmev/simple_ftl.o
-  LD [M]  /path/to/nvmev/nvmev.o
-  MODPOST /path/to/nvmev/Module.symvers
-  CC [M]  /path/to/nvmev/nvmev.mod.o
-  LD [M]  /path/to/nvmev/nvmev.ko
-  BTF [M] /path/to/nvmev/nvmev.ko
-make[1]: Leaving directory '/path/to/linux-5.15.37'
-$
-```
-
-### Using `nvmevirt`
-
-`nvmevirt` is configured to emulate the NVM SSD by default. You can attach an emulated NVM SSD in your system by loading the `nvmevirt` kernel module as follows:
-
-```bash
-$ sudo insmod ./nvmev.ko \
-  memmap_start=128G \       # e.g., 1M, 4G, 8T
-  memmap_size=64G   \       # e.g., 1M, 4G, 8T
-  cpus=7,8                  # List of CPU cores to process I/O requests (should have at least 2)
-```
-
-In the above example, `memmap_start` and `memmap_size` indicate the relative offset and the size of the reserved memory, respectively. Those values should match the configurations specified in the `/etc/default/grub` file shown earlier. In addition, the `cpus` option specifies the id of cores on which I/O dispatcher and I/O worker threads run. You have to specify at least two cores for this purpose: one for the I/O dispatcher thread, and one or more cores for the I/O worker thread(s).
-
-It is highly recommended to use the `isolcpus` Linux command-line configuration to avoid schedulers putting tasks on the CPUs that NVMeVirt uses:
-
-```bash
-GRUB_CMDLINE_LINUX="memmap=64G\\\$128G isolcpus=7,8"
-```
-
-When you are successfully load the `nvmevirt` module, you can see something like these from the system message.
-
-```log
-$ sudo dmesg
-[  144.812917] nvme nvme0: pci function 0001:10:00.0
-[  144.812975] NVMeVirt: Successfully created virtual PCI bus (node 1)
-[  144.813911] NVMeVirt: nvmev_proc_io_0 started on cpu 7 (node 1)
-[  144.813972] NVMeVirt: Successfully created Virtual NVMe device
-[  144.814032] NVMeVirt: nvmev_dispatcher started on cpu 8 (node 1)
-[  144.822075] nvme nvme0: 48/0/0 default/read/poll queues
-```
-
-If you encounter a kernel panic in `__pci_enable_msix()` or in `nvme_hwmon_init()` during `insmod`, it is because the current implementation of `nvmevirt` is not compatible with IOMMU. In this case, you can either turn off Intel VT-d or IOMMU in BIOS, or disable the interrupt remapping using the grub option as shown below:
-
-```bash
-GRUB_CMDLINE_LINUX="memmap=64G\\\$128G intremap=off"
-```
-
-Now the emulated `nvmevirt` device is ready to be used as shown below. The actual device number (`/dev/nvme0`) can vary depending on the number of real NVMe devices in your system.
-
-
-```bash
-$ ls -l /dev/nvme*
-crw------- 1 root root 242, 0 Feb 22 14:13 /dev/nvme0
-brw-rw---- 1 root disk 259, 5 Feb 22 14:13 /dev/nvme0n1
-```
-
-## Contributing
-When contributing to this repository, please first discuss the change you wish to make via [issues](https://github.com/snu-csl/nvmevirt/issues) or email(nvmevirt@gmail.com) before making a change.
-
-### Pull Requests
-1. Create a personal fork of the project on Github.
-2. Clone the fork on your local machine.
-3. Implement/fix your feature, comment your code.
-4. Follow the code style of this project, including indentation.
-5. Run tests using [nvmev-evaluation](https://github.com/snu-csl/nvmev-evaluation).
-6. From your fork open a pull request in our `main` branch!
-7. Please wait for the maintainer's review.
-
-
-## License
-
-NVMeVirt is offered under the terms of the GNU General Public License version 2 as published by the Free Software Foundation. More information about this license can be found [here](https://www.gnu.org/licenses/old-licenses/gpl-2.0.en.html).
-
-Priority queue implementation [`pqueue/`](pqueue/) is offered under the terms of the BSD 2-clause license (GPL-compatible). (Copyright (c) 2014, Volkan Yazıcı <volkan.yazici@gmail.com>. All rights reserved.)
-
-
