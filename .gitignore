@@ -173,4 +173,4 @@ sphinx_*/
 Makefile.local
 
 # AdvancedOS
-*.png
+*.png!docs/figures/*.png
